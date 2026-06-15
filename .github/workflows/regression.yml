@@ -1,0 +1,89 @@
+name: Regression Tests
+
+on:
+  push:
+    branches: [main, feat/**]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "UAT"
+        type: choice
+        options: [UAT, INT]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  regression:
+    name: Run regression suite
+    runs-on: ubuntu-latest
+    env:
+      TEST_ENV: ${{ github.event.inputs.environment || 'UAT' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: List test cases
+        id: tests
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          {
+            echo "# Regression Run Report"
+            echo ""
+            echo "- Environment: \`${TEST_ENV}\`"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo ""
+            echo "## Test Cases Discovered"
+          } > reports/summary.md
+
+          count=0
+          while IFS= read -r f; do
+            echo "- $f" >> reports/summary.md
+            count=$((count + 1))
+          done < <(find test-cases -type f -name '*.md' | sort)
+
+          echo "" >> reports/summary.md
+          echo "Total: ${count}" >> reports/summary.md
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-report
+          path: reports/
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATUS: ${{ job.status }}
+          COUNT: ${{ steps.tests.outputs.count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "SLACK_WEBHOOK_URL secret not set — skipping Slack notification."
+            exit 0
+          fi
+
+          icon=":white_check_mark:"
+          if [ "${STATUS}" != "success" ]; then icon=":x:"; fi
+
+          payload=$(cat <<JSON
+          {
+            "text": "${icon} Regression run *${STATUS}* on \`${GITHUB_REF_NAME}\` (${TEST_ENV}) — ${COUNT} test case(s) discovered. <${RUN_URL}|View run>"
+          }
+          JSON
+          )
+
+          curl -sSf -X POST -H "Content-Type: application/json" \
+            --data "${payload}" "${SLACK_WEBHOOK_URL}"
