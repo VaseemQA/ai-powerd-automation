@@ -41,6 +41,11 @@ jobs:
       - name: Install Claude Code CLI
         run: npm install -g @anthropic-ai/claude-code
 
+      - name: Show Claude CLI version & help
+        run: |
+          claude --version || true
+          claude --help 2>&1 | head -80 || true
+
       - name: Install Playwright browsers
         run: npx -y playwright install --with-deps chromium
 
@@ -55,7 +60,7 @@ jobs:
       - name: Verify Anthropic API key is set
         run: |
           if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "::error::ANTHROPIC_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions."
+            echo "::error::ANTHROPIC_API_KEY secret is not set."
             exit 1
           fi
 
@@ -87,44 +92,47 @@ jobs:
             total=$((total + 1))
             base=$(basename "$f" .md)
             log="reports/${base}.log"
-            result="reports/${base}.result"
+            prompt_file="reports/${base}.prompt"
 
             echo "::group::Running ${f}"
 
-            prompt=$(cat <<EOF
-          You are a regression test runner. Execute the test cases in the markdown file below using the Playwright MCP browser tools.
-
-          Environment:
-          - Base URL: ${BASE_URL}
-          - Prefix every relative path in the test cases with the base URL above.
-          - Read credentials from config/userdetails.md when a step says "from userdetails".
-
-          For each test case (TC-*):
-          - Execute every step in order.
-          - Mark the case PASSED only if every step's expected result is met.
-          - Mark FAILED on any failed assertion or 500 ISE error; capture the failing step number.
-
-          Output format (last line of your response, on its own line, exact JSON, no code fence):
-          RESULT_JSON: {"file":"${f}","passed":<int>,"failed":<int>,"cases":[{"id":"TC-XXX-NNN","status":"PASSED|FAILED","failed_step":<int|null>,"reason":"<short string or null>"}]}
-
-          Test case file:
-          ---
-          $(cat "$f")
-          ---
-          EOF
-          )
+            {
+              echo "You are a regression test runner. Execute every test case in the markdown file at the bottom using the Playwright MCP browser tools."
+              echo ""
+              echo "Environment:"
+              echo "- Base URL: ${BASE_URL}"
+              echo "- Prefix every relative path in the test cases with the base URL above."
+              echo "- Read credentials from config/userdetails.md when a step says 'from userdetails'."
+              echo ""
+              echo "For each test case (TC-*):"
+              echo "- Execute every step in order."
+              echo "- Mark the case PASSED only if every step's expected result is met."
+              echo "- Mark FAILED on any failed assertion or 500 ISE error; capture the failing step number."
+              echo ""
+              echo "Output format. Last line of your final response must be exactly (no code fence):"
+              echo "RESULT_JSON: {\"file\":\"${f}\",\"passed\":<int>,\"failed\":<int>,\"cases\":[{\"id\":\"TC-XXX-NNN\",\"status\":\"PASSED|FAILED\",\"failed_step\":<int|null>,\"reason\":\"<short string or null>\"}]}"
+              echo ""
+              echo "Test case file (${f}):"
+              echo "---"
+              cat "$f"
+              echo "---"
+            } > "$prompt_file"
 
             set +e
-            claude --print \
-                   --permission-mode bypassPermissions \
-                   --mcp-config .mcp.json \
-                   --output-format text \
-                   "$prompt" > "$log" 2>&1
+            cat "$prompt_file" | claude --print \
+                                        --dangerously-skip-permissions \
+                                        --mcp-config .mcp.json \
+                                        --output-format text \
+                                        > "$log" 2>&1
             exit_code=$?
             set -e
 
+            echo "----- log head (${f}) -----"
+            head -80 "$log" || true
+            echo "----- log tail (${f}) -----"
+            tail -40 "$log" || true
+
             if [ $exit_code -ne 0 ]; then
-              echo "FAILED" > "$result"
               failed=$((failed + 1))
               failed_files="${failed_files}\n- ${f} (claude exit ${exit_code})"
               echo "| \`${f}\` | :x: ERROR (exit ${exit_code}) |" >> reports/summary.md
@@ -134,7 +142,6 @@ jobs:
 
             json_line=$(grep -E '^RESULT_JSON:' "$log" | tail -1 | sed 's/^RESULT_JSON:[[:space:]]*//')
             if [ -z "$json_line" ]; then
-              echo "FAILED" > "$result"
               failed=$((failed + 1))
               failed_files="${failed_files}\n- ${f} (no RESULT_JSON in output)"
               echo "| \`${f}\` | :x: NO RESULT |" >> reports/summary.md
@@ -146,11 +153,9 @@ jobs:
             file_passed=$(echo "$json_line" | python3 -c "import json,sys;print(json.load(sys.stdin).get('passed',0))" 2>/dev/null || echo "0")
 
             if [ "$file_failed" = "0" ]; then
-              echo "PASSED" > "$result"
               passed=$((passed + 1))
               echo "| \`${f}\` | :white_check_mark: ${file_passed} passed |" >> reports/summary.md
             else
-              echo "FAILED" > "$result"
               failed=$((failed + 1))
               failed_files="${failed_files}\n- ${f} (${file_failed} case(s) failed)"
               echo "| \`${f}\` | :x: ${file_failed} failed, ${file_passed} passed |" >> reports/summary.md
@@ -172,10 +177,10 @@ jobs:
             echo "total=${total}"
             echo "passed=${passed}"
             echo "failed=${failed}"
-            echo "failed_files<<EOF"
+            echo "failed_files<<EOF_OUT"
             printf "%b" "${failed_files}"
             echo ""
-            echo "EOF"
+            echo "EOF_OUT"
           } >> "$GITHUB_OUTPUT"
 
           if [ "$failed" -gt 0 ]; then exit 1; fi
@@ -206,14 +211,17 @@ jobs:
           icon=":white_check_mark:"
           if [ "${STATUS}" != "success" ]; then icon=":x:"; fi
 
-          summary="${icon} *Regression ${STATUS}* on \`${GITHUB_REF_NAME}\` (${TEST_ENV})\nFiles: ${TOTAL:-0} • Passed: ${PASSED:-0} • Failed: ${FAILED:-0}\n<${RUN_URL}|View run & download report>"
+          SUMMARY="${icon} *Regression ${STATUS}* on \`${GITHUB_REF_NAME}\` (${TEST_ENV})
+          Files: ${TOTAL:-0} • Passed: ${PASSED:-0} • Failed: ${FAILED:-0}
+          <${RUN_URL}|View run & download report>"
 
           if [ -n "${FAILED_FILES:-}" ] && [ "${FAILED:-0}" != "0" ]; then
-            summary="${summary}\n*Failures:*${FAILED_FILES}"
+            SUMMARY="${SUMMARY}
+          *Failures:*${FAILED_FILES}"
           fi
 
-          payload=$(python3 -c "import json,os;print(json.dumps({'text': os.environ['SUMMARY']}))" <<<"" 2>/dev/null || true)
-          SUMMARY="$summary" payload=$(python3 -c "import json,os;print(json.dumps({'text': os.environ['SUMMARY']}))")
+          export SUMMARY
+          payload=$(python3 -c 'import json,os;print(json.dumps({"text": os.environ["SUMMARY"]}))')
 
           curl -sSf -X POST -H "Content-Type: application/json" \
             --data "${payload}" "${SLACK_WEBHOOK_URL}"
