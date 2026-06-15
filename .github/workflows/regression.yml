@@ -24,39 +24,163 @@ jobs:
   regression:
     name: Run regression suite
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       TEST_ENV: ${{ github.event.inputs.environment || 'UAT' }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: List test cases
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Install Playwright browsers
+        run: npx -y playwright install --with-deps chromium
+
+      - name: Resolve BASE_URL for environment
+        run: |
+          case "$TEST_ENV" in
+            UAT) echo "BASE_URL=https://uat.themoneyplatform.com" >> "$GITHUB_ENV" ;;
+            INT) echo "BASE_URL=https://int.themoneyplatform.com" >> "$GITHUB_ENV" ;;
+            *)   echo "Unknown TEST_ENV: $TEST_ENV"; exit 1 ;;
+          esac
+
+      - name: Verify Anthropic API key is set
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Run regression tests
         id: tests
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p reports
+
+          total=0
+          passed=0
+          failed=0
+          failed_files=""
+
           {
             echo "# Regression Run Report"
             echo ""
-            echo "- Environment: \`${TEST_ENV}\`"
+            echo "- Environment: \`${TEST_ENV}\` (${BASE_URL})"
             echo "- Commit: \`${GITHUB_SHA::7}\`"
             echo "- Branch: \`${GITHUB_REF_NAME}\`"
             echo ""
-            echo "## Test Cases Discovered"
+            echo "## Results"
+            echo ""
+            echo "| File | Status |"
+            echo "|------|--------|"
           } > reports/summary.md
 
-          count=0
           while IFS= read -r f; do
-            echo "- $f" >> reports/summary.md
-            count=$((count + 1))
+            total=$((total + 1))
+            base=$(basename "$f" .md)
+            log="reports/${base}.log"
+            result="reports/${base}.result"
+
+            echo "::group::Running ${f}"
+
+            prompt=$(cat <<EOF
+          You are a regression test runner. Execute the test cases in the markdown file below using the Playwright MCP browser tools.
+
+          Environment:
+          - Base URL: ${BASE_URL}
+          - Prefix every relative path in the test cases with the base URL above.
+          - Read credentials from config/userdetails.md when a step says "from userdetails".
+
+          For each test case (TC-*):
+          - Execute every step in order.
+          - Mark the case PASSED only if every step's expected result is met.
+          - Mark FAILED on any failed assertion or 500 ISE error; capture the failing step number.
+
+          Output format (last line of your response, on its own line, exact JSON, no code fence):
+          RESULT_JSON: {"file":"${f}","passed":<int>,"failed":<int>,"cases":[{"id":"TC-XXX-NNN","status":"PASSED|FAILED","failed_step":<int|null>,"reason":"<short string or null>"}]}
+
+          Test case file:
+          ---
+          $(cat "$f")
+          ---
+          EOF
+          )
+
+            set +e
+            claude --print \
+                   --permission-mode bypassPermissions \
+                   --output-format text \
+                   "$prompt" > "$log" 2>&1
+            exit_code=$?
+            set -e
+
+            if [ $exit_code -ne 0 ]; then
+              echo "FAILED" > "$result"
+              failed=$((failed + 1))
+              failed_files="${failed_files}\n- ${f} (claude exit ${exit_code})"
+              echo "| \`${f}\` | :x: ERROR (exit ${exit_code}) |" >> reports/summary.md
+              echo "::endgroup::"
+              continue
+            fi
+
+            json_line=$(grep -E '^RESULT_JSON:' "$log" | tail -1 | sed 's/^RESULT_JSON:[[:space:]]*//')
+            if [ -z "$json_line" ]; then
+              echo "FAILED" > "$result"
+              failed=$((failed + 1))
+              failed_files="${failed_files}\n- ${f} (no RESULT_JSON in output)"
+              echo "| \`${f}\` | :x: NO RESULT |" >> reports/summary.md
+              echo "::endgroup::"
+              continue
+            fi
+
+            file_failed=$(echo "$json_line" | python3 -c "import json,sys;print(json.load(sys.stdin).get('failed',1))" 2>/dev/null || echo "1")
+            file_passed=$(echo "$json_line" | python3 -c "import json,sys;print(json.load(sys.stdin).get('passed',0))" 2>/dev/null || echo "0")
+
+            if [ "$file_failed" = "0" ]; then
+              echo "PASSED" > "$result"
+              passed=$((passed + 1))
+              echo "| \`${f}\` | :white_check_mark: ${file_passed} passed |" >> reports/summary.md
+            else
+              echo "FAILED" > "$result"
+              failed=$((failed + 1))
+              failed_files="${failed_files}\n- ${f} (${file_failed} case(s) failed)"
+              echo "| \`${f}\` | :x: ${file_failed} failed, ${file_passed} passed |" >> reports/summary.md
+            fi
+
+            echo "::endgroup::"
           done < <(find test-cases -type f -name '*.md' | sort)
 
-          echo "" >> reports/summary.md
-          echo "Total: ${count}" >> reports/summary.md
-          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "## Totals"
+            echo ""
+            echo "- Files run: ${total}"
+            echo "- Passed: ${passed}"
+            echo "- Failed: ${failed}"
+          } >> reports/summary.md
+
+          {
+            echo "total=${total}"
+            echo "passed=${passed}"
+            echo "failed=${failed}"
+            echo "failed_files<<EOF"
+            printf "%b" "${failed_files}"
+            echo ""
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$failed" -gt 0 ]; then exit 1; fi
 
       - name: Upload report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: regression-report
@@ -67,7 +191,10 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           STATUS: ${{ job.status }}
-          COUNT: ${{ steps.tests.outputs.count }}
+          TOTAL: ${{ steps.tests.outputs.total }}
+          PASSED: ${{ steps.tests.outputs.passed }}
+          FAILED: ${{ steps.tests.outputs.failed }}
+          FAILED_FILES: ${{ steps.tests.outputs.failed_files }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
@@ -78,12 +205,14 @@ jobs:
           icon=":white_check_mark:"
           if [ "${STATUS}" != "success" ]; then icon=":x:"; fi
 
-          payload=$(cat <<JSON
-          {
-            "text": "${icon} Regression run *${STATUS}* on \`${GITHUB_REF_NAME}\` (${TEST_ENV}) — ${COUNT} test case(s) discovered. <${RUN_URL}|View run>"
-          }
-          JSON
-          )
+          summary="${icon} *Regression ${STATUS}* on \`${GITHUB_REF_NAME}\` (${TEST_ENV})\nFiles: ${TOTAL:-0} • Passed: ${PASSED:-0} • Failed: ${FAILED:-0}\n<${RUN_URL}|View run & download report>"
+
+          if [ -n "${FAILED_FILES:-}" ] && [ "${FAILED:-0}" != "0" ]; then
+            summary="${summary}\n*Failures:*${FAILED_FILES}"
+          fi
+
+          payload=$(python3 -c "import json,os;print(json.dumps({'text': os.environ['SUMMARY']}))" <<<"" 2>/dev/null || true)
+          SUMMARY="$summary" payload=$(python3 -c "import json,os;print(json.dumps({'text': os.environ['SUMMARY']}))")
 
           curl -sSf -X POST -H "Content-Type: application/json" \
             --data "${payload}" "${SLACK_WEBHOOK_URL}"
