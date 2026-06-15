@@ -1,895 +1,43 @@
-# AI-Powered Automation Framework Implementation Plan
+# AI-Powered Automation Framework Implementation Plan (Prompt-Only)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a test automation framework where Claude (Anthropic API) reads plain-English test cases from `.md` files at runtime and drives a headless Chromium browser via Playwright MCP, executed on GitHub Actions.
+**Goal:** Build a zero-code regression test framework. Test cases live as `.md` files in TMP regression format, credentials in a `userdetails.md` file, and GitHub Actions workflows run Claude Code CLI with a master prompt that drives Playwright MCP to execute the tests and report to GitHub summary + Slack.
 
-**Architecture:** A Node.js runner orchestrates four components: a test-case parser (markdown → structured steps), a credentials loader (`userdetails.json`), a Playwright MCP stdio client (subprocess + tool bridge), and a Claude agentic loop (sends steps + tool schemas, executes tool calls, evaluates `Expected Result`). Two GitHub workflows trigger the runner on push/PR (auto, UAT) and manual dispatch (UAT or INT, selectable test path). Reports flow to GitHub Actions summary and a Slack webhook.
+**Architecture:** No application code — only `.md` test cases, a single `userdetails.md`, two GitHub Actions workflows (auto + manual), a sanitized `.mcp.json`, and an updated `README.md`. Each workflow runs `claude -p "<master prompt>" --mcp-config .mcp.json --allowedTools "mcp__playwright__*"` with environment variables for env/test path/secrets, and Claude does discovery, parsing, execution, and reporting via prompting.
 
-**Tech Stack:** Node.js 20, `@anthropic-ai/sdk`, `@modelcontextprotocol/sdk`, `@playwright/mcp`, `gray-matter` (frontmatter parser), Node built-in `node:test` runner, GitHub Actions.
+**Tech Stack:** GitHub Actions, Claude Code CLI, Playwright MCP (`@playwright/mcp`), headless Chromium. No Node project, no test frameworks.
 
 ---
 
 ## File Structure
 
 **Files to create:**
-- `package.json` — Node project + deps
-- `.env.example` — env var template (no secrets)
-- `.mcp.json` — sanitized Playwright MCP config (committed)
-- `.gitignore` — append `.env`, `reports/*`, `node_modules`
-- `config/userdetails.json` — test user credentials
-- `test-cases/login/login-basic.md` — sample test case
-- `scripts/run-test.js` — entry point (discover tests, orchestrate, report)
-- `scripts/lib/parseTestCase.js` — markdown → `{name, environment, urlPath, steps, expectedResult}`
-- `scripts/lib/loadCredentials.js` — read & validate `config/userdetails.json`
-- `scripts/lib/playwrightMcpClient.js` — start MCP subprocess, expose tool schemas + invoke
-- `scripts/lib/runTestWithClaude.js` — Claude agentic loop: prompt → tool calls → result
-- `scripts/lib/reporter.js` — GitHub summary markdown + Slack webhook payload
-- `tests/parseTestCase.test.js` — unit tests
-- `tests/loadCredentials.test.js` — unit tests
-- `tests/reporter.test.js` — unit tests
-- `.github/workflows/run-tests.yml` — auto trigger
-- `.github/workflows/manual-run.yml` — manual dispatch
-- `reports/.gitkeep` — placeholder for runner output dir
+- `config/userdetails.md` — test user credentials (Admin, Borrower)
+- `test-cases/repayment-plan/admin-borrower-repayment-plan.md` — sample test file in TMP regression format (the one the user shared)
+- `.github/workflows/run-tests.yml` — auto trigger on push/PR (UAT)
+- `.github/workflows/manual-run.yml` — manual dispatch with environment + test path inputs
+- `reports/.gitkeep` — placeholder for workflow artifact uploads
 
 **Files to modify:**
-- `README.md` — usage instructions
-- `.mcp.json` — strip Airtable API keys (security)
+- `.mcp.json` — strip the hardcoded Airtable API keys (keep only Playwright MCP)
+- `.gitignore` — append a single rule to keep `reports/` clean except `.gitkeep`
+- `README.md` — replace with usage instructions
+
+**Cleanup:**
+- Delete `.mcp.json:Zone.Identifier` (Windows alternate-stream artifact, not needed)
 
 ---
 
-## Task 1: Initialize Node Project
+## Task 1: Sanitize `.mcp.json` and Clean Up
 
 **Files:**
-- Create: `package.json`
-- Create: `.gitignore` (append rules)
-
-- [ ] **Step 1: Create `package.json`**
-
-```json
-{
-  "name": "ai-powerd-automation",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "engines": {
-    "node": ">=20"
-  },
-  "scripts": {
-    "test": "node --test tests/",
-    "run-test": "node scripts/run-test.js"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.65.0",
-    "@modelcontextprotocol/sdk": "^1.0.4",
-    "@playwright/mcp": "^0.0.40",
-    "gray-matter": "^4.0.3"
-  }
-}
-```
-
-- [ ] **Step 2: Append to `.gitignore`**
-
-Add these lines to the existing `.gitignore`:
-
-```
-# Test runner output
-reports/*
-!reports/.gitkeep
-
-# Local env file (never commit secrets)
-.env
-```
-
-- [ ] **Step 3: Install deps and verify**
-
-Run: `cd /home/vaseem/ai-powerd-automation && npm install`
-Expected: Creates `node_modules/` and `package-lock.json`, no errors.
-
-- [ ] **Step 4: Create reports directory placeholder**
-
-Run: `mkdir -p /home/vaseem/ai-powerd-automation/reports && touch /home/vaseem/ai-powerd-automation/reports/.gitkeep`
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add package.json package-lock.json .gitignore reports/.gitkeep
-git commit -m "chore: initialize Node project with deps"
-```
-
----
-
-## Task 2: Test Case Parser (TDD)
-
-**Files:**
-- Create: `tests/parseTestCase.test.js`
-- Create: `scripts/lib/parseTestCase.js`
-
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/parseTestCase.test.js`:
-
-```javascript
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
-import { parseTestCase } from '../scripts/lib/parseTestCase.js';
-
-test('parses frontmatter and steps from a valid test case', () => {
-  const md = `---
-name: Login - Valid Credentials
-environment: both
-url_path: /login
----
-
-## Steps
-
-1. Navigate to the login page
-2. Enter the standard user email from userdetails
-3. Click the "Sign In" button
-
-## Expected Result
-User should be logged in and redirected to the dashboard.
-`;
-
-  const result = parseTestCase(md);
-
-  assert.equal(result.name, 'Login - Valid Credentials');
-  assert.equal(result.environment, 'both');
-  assert.equal(result.urlPath, '/login');
-  assert.deepEqual(result.steps, [
-    'Navigate to the login page',
-    'Enter the standard user email from userdetails',
-    'Click the "Sign In" button',
-  ]);
-  assert.equal(
-    result.expectedResult,
-    'User should be logged in and redirected to the dashboard.'
-  );
-});
-
-test('throws when frontmatter is missing required fields', () => {
-  const md = `---
-name: Bad Test
----
-
-## Steps
-1. Do something
-
-## Expected Result
-Things happen.
-`;
-  assert.throws(() => parseTestCase(md), /url_path/);
-});
-
-test('throws when Steps section is missing', () => {
-  const md = `---
-name: Bad Test
-environment: both
-url_path: /x
----
-
-## Expected Result
-Nope.
-`;
-  assert.throws(() => parseTestCase(md), /Steps/);
-});
-
-test('throws when Expected Result section is missing', () => {
-  const md = `---
-name: Bad Test
-environment: both
-url_path: /x
----
-
-## Steps
-1. Do a thing
-`;
-  assert.throws(() => parseTestCase(md), /Expected Result/);
-});
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cd /home/vaseem/ai-powerd-automation && npm test`
-Expected: FAIL — `Cannot find module '../scripts/lib/parseTestCase.js'`
-
-- [ ] **Step 3: Write the implementation**
-
-Create `scripts/lib/parseTestCase.js`:
-
-```javascript
-import matter from 'gray-matter';
-
-export function parseTestCase(markdown) {
-  const parsed = matter(markdown);
-  const fm = parsed.data;
-
-  if (!fm.name) throw new Error('Frontmatter missing required field: name');
-  if (!fm.environment) throw new Error('Frontmatter missing required field: environment');
-  if (!fm.url_path) throw new Error('Frontmatter missing required field: url_path');
-
-  const body = parsed.content;
-  const stepsMatch = body.match(/##\s+Steps\s*\n([\s\S]*?)(?=\n##\s+|$)/);
-  if (!stepsMatch) throw new Error('Test case missing "## Steps" section');
-
-  const steps = stepsMatch[1]
-    .split('\n')
-    .map((line) => line.match(/^\s*\d+\.\s+(.*\S)\s*$/))
-    .filter(Boolean)
-    .map((m) => m[1]);
-
-  if (steps.length === 0) throw new Error('Test case has no numbered steps');
-
-  const expectedMatch = body.match(/##\s+Expected Result\s*\n([\s\S]*?)(?=\n##\s+|$)/);
-  if (!expectedMatch) throw new Error('Test case missing "## Expected Result" section');
-
-  const expectedResult = expectedMatch[1].trim();
-
-  return {
-    name: fm.name,
-    environment: fm.environment,
-    urlPath: fm.url_path,
-    steps,
-    expectedResult,
-  };
-}
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cd /home/vaseem/ai-powerd-automation && npm test`
-Expected: All 4 tests in `parseTestCase.test.js` PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add scripts/lib/parseTestCase.js tests/parseTestCase.test.js
-git commit -m "feat: add test case markdown parser"
-```
-
----
-
-## Task 3: Credentials Loader (TDD)
-
-**Files:**
-- Create: `tests/loadCredentials.test.js`
-- Create: `scripts/lib/loadCredentials.js`
-- Create: `config/userdetails.json`
-
-- [ ] **Step 1: Create the credentials file**
-
-Create `config/userdetails.json`:
-
-```json
-{
-  "users": {
-    "standard": {
-      "email": "testuser@tmp.com",
-      "password": "REPLACE_WITH_REAL_PASSWORD"
-    },
-    "admin": {
-      "email": "admin@tmp.com",
-      "password": "REPLACE_WITH_REAL_PASSWORD"
-    }
-  }
-}
-```
-
-- [ ] **Step 2: Write the failing test**
-
-Create `tests/loadCredentials.test.js`:
-
-```javascript
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
-import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { loadCredentials } from '../scripts/lib/loadCredentials.js';
-
-function makeTempFile(contents) {
-  const dir = mkdtempSync(join(tmpdir(), 'creds-'));
-  const path = join(dir, 'userdetails.json');
-  writeFileSync(path, contents);
-  return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
-}
-
-test('loads valid credentials file', () => {
-  const { path, cleanup } = makeTempFile(JSON.stringify({
-    users: {
-      standard: { email: 'a@b.com', password: 'pw1' },
-      admin: { email: 'c@d.com', password: 'pw2' },
-    },
-  }));
-  try {
-    const creds = loadCredentials(path);
-    assert.equal(creds.users.standard.email, 'a@b.com');
-    assert.equal(creds.users.admin.password, 'pw2');
-  } finally {
-    cleanup();
-  }
-});
-
-test('throws when file is missing', () => {
-  assert.throws(() => loadCredentials('/nonexistent/path.json'), /not found/i);
-});
-
-test('throws when JSON is malformed', () => {
-  const { path, cleanup } = makeTempFile('{ not json');
-  try {
-    assert.throws(() => loadCredentials(path), /parse/i);
-  } finally {
-    cleanup();
-  }
-});
-
-test('throws when users key is missing', () => {
-  const { path, cleanup } = makeTempFile(JSON.stringify({ wrong: {} }));
-  try {
-    assert.throws(() => loadCredentials(path), /users/);
-  } finally {
-    cleanup();
-  }
-});
-```
-
-- [ ] **Step 3: Run test to verify it fails**
-
-Run: `cd /home/vaseem/ai-powerd-automation && npm test`
-Expected: FAIL — `Cannot find module '../scripts/lib/loadCredentials.js'`
-
-- [ ] **Step 4: Write the implementation**
-
-Create `scripts/lib/loadCredentials.js`:
-
-```javascript
-import { readFileSync, existsSync } from 'node:fs';
-
-export function loadCredentials(path) {
-  if (!existsSync(path)) {
-    throw new Error(`Credentials file not found: ${path}`);
-  }
-  const raw = readFileSync(path, 'utf8');
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`Failed to parse credentials JSON: ${err.message}`);
-  }
-  if (!parsed.users || typeof parsed.users !== 'object') {
-    throw new Error('Credentials file must contain a "users" object');
-  }
-  return parsed;
-}
-```
-
-- [ ] **Step 5: Run test to verify it passes**
-
-Run: `cd /home/vaseem/ai-powerd-automation && npm test`
-Expected: All tests pass.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add scripts/lib/loadCredentials.js tests/loadCredentials.test.js config/userdetails.json
-git commit -m "feat: add credentials loader and userdetails template"
-```
-
----
-
-## Task 4: Reporter (TDD)
-
-**Files:**
-- Create: `tests/reporter.test.js`
-- Create: `scripts/lib/reporter.js`
-
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/reporter.test.js`:
-
-```javascript
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
-import { formatGithubSummary, formatSlackPayload } from '../scripts/lib/reporter.js';
-
-const sampleResults = [
-  { name: 'Login - Valid', status: 'pass', durationMs: 4200 },
-  { name: 'Login - Invalid', status: 'fail', durationMs: 2100, error: 'Dashboard did not load' },
-];
-
-test('formatGithubSummary produces a markdown table with totals', () => {
-  const md = formatGithubSummary({
-    environment: 'UAT',
-    results: sampleResults,
-    runUrl: 'https://github.com/x/y/actions/runs/123',
-  });
-
-  assert.match(md, /Environment.*UAT/);
-  assert.match(md, /\|.*Test.*\|.*Status.*\|.*Duration.*\|/);
-  assert.match(md, /Login - Valid/);
-  assert.match(md, /Login - Invalid/);
-  assert.match(md, /Dashboard did not load/);
-  assert.match(md, /Passed.*1/);
-  assert.match(md, /Failed.*1/);
-});
-
-test('formatSlackPayload produces a JSON object with summary text', () => {
-  const payload = formatSlackPayload({
-    environment: 'INT',
-    results: sampleResults,
-    runUrl: 'https://github.com/x/y/actions/runs/123',
-  });
-
-  assert.equal(typeof payload.text, 'string');
-  assert.match(payload.text, /INT/);
-  assert.match(payload.text, /1 passed/);
-  assert.match(payload.text, /1 failed/);
-  assert.match(payload.text, /https:\/\/github\.com\/x\/y\/actions\/runs\/123/);
-});
-
-test('formatSlackPayload reports all-pass cleanly', () => {
-  const payload = formatSlackPayload({
-    environment: 'UAT',
-    results: [{ name: 'A', status: 'pass', durationMs: 100 }],
-    runUrl: 'https://example.com/run',
-  });
-  assert.match(payload.text, /1 passed/);
-  assert.match(payload.text, /0 failed/);
-});
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cd /home/vaseem/ai-powerd-automation && npm test`
-Expected: FAIL — `Cannot find module '../scripts/lib/reporter.js'`
-
-- [ ] **Step 3: Write the implementation**
-
-Create `scripts/lib/reporter.js`:
-
-```javascript
-function counts(results) {
-  const passed = results.filter((r) => r.status === 'pass').length;
-  const failed = results.filter((r) => r.status === 'fail').length;
-  return { passed, failed };
-}
-
-export function formatGithubSummary({ environment, results, runUrl }) {
-  const { passed, failed } = counts(results);
-  const lines = [
-    `# Test Run Results`,
-    ``,
-    `**Environment:** ${environment}`,
-    `**Run:** ${runUrl}`,
-    ``,
-    `**Passed:** ${passed}  |  **Failed:** ${failed}`,
-    ``,
-    `| Test | Status | Duration | Notes |`,
-    `| --- | --- | --- | --- |`,
-  ];
-  for (const r of results) {
-    const icon = r.status === 'pass' ? '✅ pass' : '❌ fail';
-    const dur = `${(r.durationMs / 1000).toFixed(1)}s`;
-    const notes = r.error ? r.error.replace(/\|/g, '\\|').slice(0, 200) : '';
-    lines.push(`| ${r.name} | ${icon} | ${dur} | ${notes} |`);
-  }
-  return lines.join('\n');
-}
-
-export function formatSlackPayload({ environment, results, runUrl }) {
-  const { passed, failed } = counts(results);
-  const headline = failed === 0 ? '✅ All tests passed' : '❌ Some tests failed';
-  const text = `${headline}\nEnvironment: ${environment}\n${passed} passed, ${failed} failed\nRun: ${runUrl}`;
-  return { text };
-}
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cd /home/vaseem/ai-powerd-automation && npm test`
-Expected: All tests pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add scripts/lib/reporter.js tests/reporter.test.js
-git commit -m "feat: add reporter for GitHub summary and Slack payloads"
-```
-
----
-
-## Task 5: Playwright MCP Client Wrapper
-
-**Files:**
-- Create: `scripts/lib/playwrightMcpClient.js`
-
-This wrapper starts the Playwright MCP server as a subprocess (stdio transport), connects via the MCP SDK, lists tools, and exposes a `callTool(name, args)` function. No unit test — verified via integration in Task 7.
-
-- [ ] **Step 1: Write the implementation**
-
-Create `scripts/lib/playwrightMcpClient.js`:
-
-```javascript
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-
-export async function startPlaywrightMcp() {
-  const transport = new StdioClientTransport({
-    command: 'npx',
-    args: ['-y', '@playwright/mcp@latest', '--headless'],
-  });
-
-  const client = new Client(
-    { name: 'ai-powerd-automation', version: '0.1.0' },
-    { capabilities: {} }
-  );
-
-  await client.connect(transport);
-
-  const { tools } = await client.listTools();
-
-  const callTool = async (name, args) => {
-    const result = await client.callTool({ name, arguments: args });
-    return result;
-  };
-
-  const close = async () => {
-    await client.close();
-  };
-
-  return { tools, callTool, close };
-}
-```
-
-- [ ] **Step 2: Smoke test manually**
-
-Run a quick smoke check that the MCP subprocess starts and lists tools:
-
-```bash
-cd /home/vaseem/ai-powerd-automation && node --input-type=module -e "
-import { startPlaywrightMcp } from './scripts/lib/playwrightMcpClient.js';
-const mcp = await startPlaywrightMcp();
-console.log('Tool count:', mcp.tools.length);
-console.log('First tool:', mcp.tools[0]?.name);
-await mcp.close();
-"
-```
-
-Expected: Prints a tool count > 5 and a tool name like `browser_navigate`. No errors.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add scripts/lib/playwrightMcpClient.js
-git commit -m "feat: add Playwright MCP stdio client wrapper"
-```
-
----
-
-## Task 6: Claude Agentic Loop
-
-**Files:**
-- Create: `scripts/lib/runTestWithClaude.js`
-
-Runs one test case: builds a prompt with steps + credentials, sends to Claude with Playwright MCP tools as the tool schema, executes any tool calls Claude requests, loops until Claude returns a final pass/fail verdict.
-
-- [ ] **Step 1: Write the implementation**
-
-Create `scripts/lib/runTestWithClaude.js`:
-
-```javascript
-import Anthropic from '@anthropic-ai/sdk';
-
-const MODEL = 'claude-sonnet-4-6';
-const MAX_ITERATIONS = 30;
-
-function mcpToolsToAnthropicSchema(mcpTools) {
-  return mcpTools.map((t) => ({
-    name: t.name,
-    description: t.description ?? '',
-    input_schema: t.inputSchema ?? { type: 'object', properties: {} },
-  }));
-}
-
-function buildSystemPrompt({ baseUrl, credentials }) {
-  return `You are a test automation agent. You execute test cases by calling Playwright MCP browser tools.
-
-Base URL: ${baseUrl}
-When a step references a URL path, prefix it with the base URL.
-
-Available test users (use when a step says "from userdetails"):
-${JSON.stringify(credentials.users, null, 2)}
-
-Rules:
-- Execute steps in order using browser tools.
-- After completing all steps, evaluate the Expected Result against the page state.
-- When you finish (pass or fail), respond with a single final message that starts with either "VERDICT: PASS" or "VERDICT: FAIL", followed by a one-line reason.
-- If a tool call errors irrecoverably, return "VERDICT: FAIL" with the error.
-- Do NOT include the verdict in any message that also contains tool calls.`;
-}
-
-function buildUserPrompt({ testCase }) {
-  const stepsList = testCase.steps.map((s, i) => `${i + 1}. ${s}`).join('\n');
-  return `Test: ${testCase.name}
-Starting URL path: ${testCase.urlPath}
-
-Steps:
-${stepsList}
-
-Expected Result:
-${testCase.expectedResult}`;
-}
-
-export async function runTestWithClaude({ testCase, baseUrl, credentials, mcpClient, apiKey }) {
-  const anthropic = new Anthropic({ apiKey });
-  const tools = mcpToolsToAnthropicSchema(mcpClient.tools);
-  const messages = [{ role: 'user', content: buildUserPrompt({ testCase }) }];
-  const startedAt = Date.now();
-
-  for (let i = 0; i < MAX_ITERATIONS; i++) {
-    const response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 4096,
-      system: buildSystemPrompt({ baseUrl, credentials }),
-      tools,
-      messages,
-    });
-
-    messages.push({ role: 'assistant', content: response.content });
-
-    const toolUses = response.content.filter((b) => b.type === 'tool_use');
-    if (toolUses.length === 0) {
-      const textBlock = response.content.find((b) => b.type === 'text');
-      const text = textBlock?.text ?? '';
-      const status = /VERDICT:\s*PASS/i.test(text) ? 'pass' : 'fail';
-      const reason = text.replace(/^[\s\S]*VERDICT:\s*(PASS|FAIL)\s*[:\-]?\s*/i, '').trim();
-      return {
-        status,
-        durationMs: Date.now() - startedAt,
-        reason,
-      };
-    }
-
-    const toolResults = [];
-    for (const tu of toolUses) {
-      try {
-        const result = await mcpClient.callTool(tu.name, tu.input);
-        const contentBlocks = result.content ?? [{ type: 'text', text: 'ok' }];
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: tu.id,
-          content: contentBlocks,
-        });
-      } catch (err) {
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: tu.id,
-          is_error: true,
-          content: [{ type: 'text', text: String(err.message ?? err) }],
-        });
-      }
-    }
-    messages.push({ role: 'user', content: toolResults });
-  }
-
-  return {
-    status: 'fail',
-    durationMs: Date.now() - startedAt,
-    reason: `Exceeded max iterations (${MAX_ITERATIONS}) without verdict`,
-  };
-}
-```
-
-- [ ] **Step 2: Commit**
-
-```bash
-git add scripts/lib/runTestWithClaude.js
-git commit -m "feat: add Claude agentic loop for test execution"
-```
-
----
-
-## Task 7: Main Runner Entry Point
-
-**Files:**
-- Create: `scripts/run-test.js`
-- Create: `.env.example`
-
-Discovers test files at a given path, runs each one, collects results, writes the GitHub summary, posts to Slack. Honors env vars for environment selection and secrets.
-
-- [ ] **Step 1: Create `.env.example`**
-
-```bash
-# Used locally; in GitHub Actions these come from Secrets
-ANTHROPIC_API_KEY=sk-ant-...
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
-TMP_UAT_URL=https://uat.tmp.example
-TMP_INT_URL=https://int.tmp.example
-
-# Set per run
-ENVIRONMENT=UAT       # UAT or INT
-TEST_PATH=test-cases/ # file or directory
-```
-
-- [ ] **Step 2: Write the implementation**
-
-Create `scripts/run-test.js`:
-
-```javascript
-import { readFileSync, statSync, readdirSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
-import { parseTestCase } from './lib/parseTestCase.js';
-import { loadCredentials } from './lib/loadCredentials.js';
-import { startPlaywrightMcp } from './lib/playwrightMcpClient.js';
-import { runTestWithClaude } from './lib/runTestWithClaude.js';
-import { formatGithubSummary, formatSlackPayload } from './lib/reporter.js';
-
-function discoverTestFiles(target) {
-  const abs = resolve(target);
-  const stat = statSync(abs);
-  if (stat.isFile()) return [abs];
-  const out = [];
-  const walk = (dir) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const p = join(dir, entry.name);
-      if (entry.isDirectory()) walk(p);
-      else if (entry.isFile() && p.endsWith('.md')) out.push(p);
-    }
-  };
-  walk(abs);
-  return out.sort();
-}
-
-function envFor(name) {
-  const value = process.env[name];
-  if (!value) throw new Error(`Required environment variable not set: ${name}`);
-  return value;
-}
-
-async function postSlack(webhookUrl, payload) {
-  const res = await fetch(webhookUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    console.error(`Slack webhook failed: ${res.status} ${await res.text()}`);
-  }
-}
-
-async function main() {
-  const environment = (process.env.ENVIRONMENT ?? 'UAT').toUpperCase();
-  const testPath = process.env.TEST_PATH ?? 'test-cases/';
-  const apiKey = envFor('ANTHROPIC_API_KEY');
-  const baseUrl = environment === 'INT' ? envFor('TMP_INT_URL') : envFor('TMP_UAT_URL');
-  const slackUrl = process.env.SLACK_WEBHOOK_URL;
-  const runUrl =
-    process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
-      ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
-      : 'local';
-
-  const credentials = loadCredentials('config/userdetails.json');
-  const files = discoverTestFiles(testPath);
-  if (files.length === 0) {
-    console.error(`No test files found at ${testPath}`);
-    process.exit(1);
-  }
-
-  console.log(`Running ${files.length} test(s) on ${environment} (${baseUrl})`);
-
-  const mcp = await startPlaywrightMcp();
-  const results = [];
-
-  try {
-    for (const file of files) {
-      const md = readFileSync(file, 'utf8');
-      let testCase;
-      try {
-        testCase = parseTestCase(md);
-      } catch (err) {
-        results.push({
-          name: file,
-          status: 'fail',
-          durationMs: 0,
-          error: `Parse error: ${err.message}`,
-        });
-        continue;
-      }
-
-      if (testCase.environment !== 'both' && testCase.environment.toUpperCase() !== environment) {
-        console.log(`Skipping ${testCase.name} (not for ${environment})`);
-        continue;
-      }
-
-      console.log(`▶ ${testCase.name}`);
-      const result = await runTestWithClaude({
-        testCase,
-        baseUrl,
-        credentials,
-        mcpClient: mcp,
-        apiKey,
-      });
-      console.log(`  → ${result.status} (${(result.durationMs / 1000).toFixed(1)}s) ${result.reason ?? ''}`);
-      results.push({
-        name: testCase.name,
-        status: result.status,
-        durationMs: result.durationMs,
-        error: result.status === 'fail' ? result.reason : undefined,
-      });
-    }
-  } finally {
-    await mcp.close();
-  }
-
-  const summary = formatGithubSummary({ environment, results, runUrl });
-  console.log('\n' + summary);
-
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + '\n');
-  }
-  writeFileSync('reports/summary.md', summary);
-
-  if (slackUrl) {
-    await postSlack(slackUrl, formatSlackPayload({ environment, results, runUrl }));
-  }
-
-  const anyFailed = results.some((r) => r.status === 'fail');
-  process.exit(anyFailed ? 1 : 0);
-}
-
-main().catch((err) => {
-  console.error('Runner crashed:', err);
-  process.exit(2);
-});
-```
-
-- [ ] **Step 3: Verify it loads without runtime error (no API key needed for module load)**
-
-Run: `cd /home/vaseem/ai-powerd-automation && node --check scripts/run-test.js`
-Expected: No output (syntax OK).
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add scripts/run-test.js .env.example
-git commit -m "feat: add main test runner entry point"
-```
-
----
-
-## Task 8: Sample Test Case + Sanitize `.mcp.json`
-
-**Files:**
-- Create: `test-cases/login/login-basic.md`
 - Modify: `.mcp.json`
+- Delete: `.mcp.json:Zone.Identifier`
 
-- [ ] **Step 1: Create the sample test case**
+The current `.mcp.json` (untracked) contains hardcoded Airtable API keys. Strip everything but Playwright MCP before committing.
 
-Create `test-cases/login/login-basic.md`:
-
-```markdown
----
-name: Login - Valid Credentials
-environment: both
-url_path: /login
----
-
-## Steps
-
-1. Navigate to the login page using the starting URL path
-2. Enter the standard user email from userdetails into the email field
-3. Enter the standard user password from userdetails into the password field
-4. Click the "Sign In" button
-5. Wait for the page to load
-6. Take a screenshot
-
-## Expected Result
-The user is logged in and the dashboard page is visible.
-```
-
-- [ ] **Step 2: Sanitize `.mcp.json`**
-
-The current `.mcp.json` contains hardcoded Airtable API keys that must NOT be committed to a remote repo. Replace the file contents with this minimal version (Playwright MCP only — the only one the runner uses):
+- [ ] **Step 1: Replace `.mcp.json` with the sanitized version**
 
 ```json
 {
@@ -907,21 +55,336 @@ The current `.mcp.json` contains hardcoded Airtable API keys that must NOT be co
 }
 ```
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 2: Delete the Zone.Identifier file**
 
 ```bash
-git add test-cases/login/login-basic.md .mcp.json
-git commit -m "feat: add sample login test case and sanitize mcp config"
+rm /home/vaseem/ai-powerd-automation/.mcp.json:Zone.Identifier
+```
+
+- [ ] **Step 3: Verify no API keys remain anywhere in the file**
+
+```bash
+grep -i "patffCGn\|api_key\|API_KEY\|airtable" /home/vaseem/ai-powerd-automation/.mcp.json && echo FAIL || echo OK
+```
+
+Expected: `OK` (grep finds nothing).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add .mcp.json
+git commit -m "chore: sanitize .mcp.json — keep only Playwright MCP"
 ```
 
 ---
 
-## Task 9: GitHub Workflow — Auto Trigger
+## Task 2: Create `config/userdetails.md`
+
+**Files:**
+- Create: `config/userdetails.md`
+
+- [ ] **Step 1: Create the file**
+
+Path: `/home/vaseem/ai-powerd-automation/config/userdetails.md`
+
+Contents:
+
+```markdown
+# Test User Credentials
+
+Single source of truth for test users. Test cases reference this file by user role
+(e.g. "Enter the admin email from userdetails").
+
+## Admin
+- **Email**: `vaseem@simformsolutions.com`
+- **Password**: `Test@123`
+
+## Borrower (Standard)
+- **Email**: `borrower@example.com`
+- **Password**: `Test@123`
+```
+
+(Replace the borrower placeholders with real values when you have them.)
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add config/userdetails.md
+git commit -m "feat: add userdetails.md for test credentials"
+```
+
+---
+
+## Task 3: Create the Sample Test File
+
+**Files:**
+- Create: `test-cases/repayment-plan/admin-borrower-repayment-plan.md`
+
+This is the TMP repayment-plan regression suite the user shared, with only one adjustment: hardcoded `https://uat.themoneyplatform.com/...` URLs are replaced with relative paths so the same file runs on both UAT and INT.
+
+- [ ] **Step 1: Create the directory**
+
+```bash
+mkdir -p /home/vaseem/ai-powerd-automation/test-cases/repayment-plan
+```
+
+- [ ] **Step 2: Create the file**
+
+Path: `/home/vaseem/ai-powerd-automation/test-cases/repayment-plan/admin-borrower-repayment-plan.md`
+
+Contents (full):
+
+````markdown
+# Admin - Repayment Plan Setup Regression Test Cases
+
+## Document Information
+- **Product**: TMP Admin - Repayment Plan Management
+- **Test Environment**: UAT or INT (selected at run time)
+- **Last Updated**: 2026-03-13
+- **Test Type**: Regression Testing - Admin Repayment Plan Setup
+- **User Role**: Admin / Super Admin
+
+---
+
+## Test Data Configuration
+
+### Admin Credentials
+See `config/userdetails.md` (Admin user).
+
+### Loan Parameters (Test Application)
+- **Application ID**: 13243
+- **Loan ID**: 3058
+- **Borrower**: Accept Test
+- **Loan Amount**: £999.00
+- **Term**: 6 weeks
+- **Daily Rate**: 0.8%
+- **Installments**: 2
+
+### Repayment Plan Parameters
+- **Amount**: £999.00
+- **Installment Amount**: £200.00
+- **Frequency**: Monthly
+- **Placement Type**: Last Weekday
+- **Start Date**: 30/03/2026
+
+> All URLs in step tables are relative paths. The runner prefixes them with the
+> selected environment's base URL (UAT or INT).
+
+---
+
+## 1. Admin can setup repayment plan for a specific loan
+
+### TC-RP-001: Admin Login
+**Objective**: Verify admin can successfully login to TMP admin panel
+**Priority**: Critical
+**Preconditions**: Valid admin credentials
+
+| Step | Action | Expected Result |
+|------|--------|-----------------|
+| 1 | Navigate to `/login` | Login page displayed with Email, Password fields and Login button. **FAIL** if 500 ISE error is displayed |
+| 2 | Enter the admin email from userdetails | Email field populated. **FAIL** if 500 ISE error is displayed |
+| 3 | Enter the admin password from userdetails | Password field populated (masked). **FAIL** if 500 ISE error is displayed |
+| 4 | Click "Login" button | Redirect to admin dashboard `/admin/dashboard`. **FAIL** if 500 ISE error is displayed |
+| 5 | Verify admin dashboard loaded | "The Money Platform" heading displayed, Today's Payments section visible. **FAIL** if 500 ISE error is displayed |
+
+**Pass Criteria**: Admin logged in and dashboard accessible
+**Fail Criteria**: Login fails, dashboard not accessible, or 500 ISE error on any step
+
+---
+
+### TC-RP-002: Admin can setup repayment plan for a specific loan
+**Objective**: Verify admin can setup repayment plan for a specific loan
+**Priority**: High
+**Preconditions**: Admin logged in (from TC-RP-001)
+
+| Step | Action | Expected Result |
+|------|--------|-----------------|
+| 1 | Navigate to `/admin/loans/list/1/started` | Loan page displayed with list of started loans. **FAIL** if 500 ISE error is displayed |
+| 2 | Select any one loan from the list and click "Details" | Loan details page displayed with loan summary. **FAIL** if 500 ISE error is displayed |
+| 3 | Verify application state | State badge displayed (e.g., "loaned"). **FAIL** if 500 ISE error is displayed |
+| 4 | Note the "Amount to be repaid £XYZ" from the loan summary panel | Loan summary with amount displayed. **FAIL** if 500 ISE error is displayed |
+| 5 | Click "Repayment Plan" button | Repayment plan setup form displayed. **FAIL** if 500 ISE error is displayed |
+| 6 | Enter the Amount as £XYZ (from step 4) | Amount field populated with loan amount. **FAIL** if 500 ISE error is displayed |
+| 7 | Enter an installment amount less than £XYZ | Installment amount field populated. **FAIL** if 500 ISE error is displayed |
+| 8 | Select frequency "Monthly" | Monthly frequency selected. **FAIL** if 500 ISE error is displayed |
+| 9 | Select placement type "Last Weekday" | Last Weekday placement type selected. **FAIL** if 500 ISE error is displayed |
+| 10 | Verify application state | State badge displayed (e.g., "planned"). **FAIL** if 500 ISE error is displayed |
+| 11 | Click "Accept Test" borrower name link, then click "Impersonate this user" | Redirected to borrower dashboard as impersonated user. **FAIL** if 500 ISE error is displayed |
+| 12 | Verify "You are currently on a Repayment Plan." text | Repayment plan confirmation text visible. **FAIL** if 500 ISE error is displayed |
+| 13 | Navigate to `/logout` | User logged out and redirected to homepage. **FAIL** if 500 ISE error is displayed |
+
+**Pass Criteria**: Repayment plan setup by admin works without errors
+**Fail Criteria**: Page 404/500 ISE error on any step, or incorrect data displayed
+
+---
+
+## 2. Borrower can setup repayment plan for a specific loan
+
+### TC-RP-003: Admin Login (for impersonation)
+**Objective**: Admin login as a precondition to impersonate a borrower
+**Priority**: Critical
+
+| Step | Action | Expected Result |
+|------|--------|-----------------|
+| 1 | Navigate to `/login` | Login page displayed. **FAIL** if 500 ISE error is displayed |
+| 2 | Enter the admin email from userdetails | Email field populated. **FAIL** if 500 ISE error is displayed |
+| 3 | Enter the admin password from userdetails | Password field populated. **FAIL** if 500 ISE error is displayed |
+| 4 | Click "Login" button | Redirect to `/admin/dashboard`. **FAIL** if 500 ISE error is displayed |
+| 5 | Verify admin dashboard loaded | "The Money Platform" heading displayed. **FAIL** if 500 ISE error is displayed |
+
+**Pass Criteria**: Admin logged in
+**Fail Criteria**: Login fails or 500 ISE error
+
+---
+
+### TC-RP-004: Borrower can setup repayment plan for a specific loan
+**Objective**: Verify borrower can setup repayment plan for a specific loan
+**Priority**: High
+**Preconditions**: Admin logged in (TC-RP-003)
+
+| Step | Action | Expected Result |
+|------|--------|-----------------|
+| 1 | Navigate to `/admin/loans/list/1/started` | Loan page displayed with started loans. **FAIL** if 500 ISE error is displayed |
+| 2 | Select a loan and click "Details" | Loan details page displayed. **FAIL** if 500 ISE error is displayed |
+| 3 | Verify application state | State badge displayed (e.g., "loaned"). **FAIL** if 500 ISE error is displayed |
+| 4 | Click "Accept Test" borrower name link | User details page displayed. **FAIL** if 500 ISE error is displayed |
+| 5 | Click "Toggle User Flag" | User flag toggled successfully. **FAIL** if 500 ISE error is displayed |
+| 6 | Click "Impersonate this user" | Redirected to borrower dashboard. **FAIL** if 500 ISE error is displayed |
+| 7 | Click "Help with my loan" | Help options displayed. **FAIL** if button missing or 500 ISE |
+| 8 | Click "Enter a repayment plan" | Repayment plan setup form displayed. **FAIL** if button missing or 500 ISE |
+| 9 | Enter installment amount less than total balance | Amount field populated. **FAIL** if 500 ISE error is displayed |
+| 10 | Select frequency "Monthly" | Monthly frequency selected. **FAIL** if 500 ISE error is displayed |
+| 11 | Select placement type "Last Weekday" | Last Weekday placement type selected. **FAIL** if 500 ISE error is displayed |
+| 12 | Click "Continue" | Repayment plan summary/confirmation page displayed. **FAIL** if 500 ISE error is displayed |
+| 13 | Tick the "I agree for my payments to be processed... CPA" checkbox | Checkbox checked. **FAIL** if 500 ISE error is displayed |
+| 14 | Click "Confirm Repayment Plan" | Redirected to card payment page. **FAIL** if 500 ISE error is displayed |
+| 15 | Enter card details: number `4477 0000 0000 0006`, expiry `12/99`, CVV `111`, name `setup complete` | Card details entered and payment processed. **FAIL** if 500 ISE error is displayed |
+| 16 | Refresh the page two times and click "Continue" | Page refreshed and continue completed. **FAIL** if 500 ISE error is displayed |
+| 17 | Verify "You are currently on a Repayment Plan." text | Confirmation text visible. **FAIL** if 500 ISE error is displayed |
+| 18 | Navigate to `/logout` | Logged out and redirected to homepage. **FAIL** if 500 ISE error is displayed |
+
+**Pass Criteria**: Borrower-initiated repayment plan setup works without errors
+**Fail Criteria**: Page 404/500 ISE error on any step, or incorrect data displayed
+
+---
+
+## 3. Borrower can pay repayment plan installment
+
+### TC-RP-005: Admin Login (for impersonation)
+**Objective**: Admin login as a precondition to impersonate a borrower
+**Priority**: Critical
+
+| Step | Action | Expected Result |
+|------|--------|-----------------|
+| 1 | Navigate to `/login` | Login page displayed. **FAIL** if 500 ISE error is displayed |
+| 2 | Enter the admin email from userdetails | Email field populated. **FAIL** if 500 ISE error is displayed |
+| 3 | Enter the admin password from userdetails | Password field populated. **FAIL** if 500 ISE error is displayed |
+| 4 | Click "Login" button | Redirect to `/admin/dashboard`. **FAIL** if 500 ISE error is displayed |
+| 5 | Verify admin dashboard loaded | "The Money Platform" heading displayed. **FAIL** if 500 ISE error is displayed |
+
+**Pass Criteria**: Admin logged in
+**Fail Criteria**: Login fails or 500 ISE error
+
+---
+
+### TC-RP-006: Borrower can pay repayment plan installment
+**Objective**: Verify borrower can pay a repayment plan installment
+**Priority**: High
+**Preconditions**: Admin logged in (TC-RP-005)
+
+| Step | Action | Expected Result |
+|------|--------|-----------------|
+| 1 | Navigate to `/admin/repayment-plans` | Repayment plans page with list of plans displayed. **FAIL** if 500 ISE error is displayed |
+| 2 | Select a repayment plan and click "Details" | Plan details page displayed. **FAIL** if 500 ISE error is displayed |
+| 3 | Verify application state | State badge displayed (e.g., "planned"). **FAIL** if 500 ISE error is displayed |
+| 4 | Click "Accept Test" borrower name link, then "Toggle User Flag" | User flag toggled. **FAIL** if 500 ISE error is displayed |
+| 5 | Click "Impersonate this user" | Redirected to borrower dashboard. **FAIL** if 500 ISE error is displayed |
+| 6 | Verify "You are currently on a Repayment Plan." text | Text visible on borrower dashboard. **FAIL** if 500 ISE error is displayed |
+| 7 | Verify "Make a Payment" button is visible and click it | Payment page displayed with amount + payment method options. **FAIL** if button missing or 500 ISE |
+| 8 | Enter installment amount (e.g., £40) and complete the payment | Payment processed via card/bank. **FAIL** if 500 ISE error is displayed |
+| 9 | Verify "Your payment was successful" text on dashboard | Success message visible. **FAIL** if 500 ISE error is displayed |
+| 10 | Navigate to `/logout` | Logged out and redirected to homepage. **FAIL** if 500 ISE error is displayed |
+
+**Pass Criteria**: Borrower can pay repayment plan installment without errors
+**Fail Criteria**: Page 404/500 ISE error on any step, or incorrect data displayed
+````
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add test-cases/
+git commit -m "feat: add TMP repayment-plan regression test suite"
+```
+
+---
+
+## Task 4: Create the Master Prompt as a Reusable Block
+
+The master prompt is identical across both workflows. Storing it as a heredoc inside each workflow file is fine — but to keep them in sync, we paste the same prompt verbatim in both workflow files. Below is the canonical text used in Tasks 5 and 6.
+
+**Canonical master prompt (copy this exactly into both workflows in Tasks 5 and 6):**
+
+````
+You are a TMP regression test execution agent. You have Playwright MCP browser tools available (mcp__playwright__*).
+
+Inputs (from environment variables):
+- TMP_BASE_URL: base URL for the target environment (e.g. https://uat.themoneyplatform.com)
+- TEST_PATH: a file path or directory under test-cases/
+
+Your job:
+1. Read config/userdetails.md to learn available test users (Admin, Borrower, etc).
+2. Discover all *.md files at $TEST_PATH (or treat $TEST_PATH as a single file if it ends in .md). Process them in alphabetical order.
+3. For each test case (each "### TC-..." heading) in each file:
+   a. Read the step table (columns: Step, Action, Expected Result).
+   b. Execute each step using Playwright MCP browser tools.
+      - Prefix any relative URL like "/login" with $TMP_BASE_URL.
+      - When a step says "from userdetails", look up the value in config/userdetails.md by the role mentioned in the step (Admin or Borrower).
+      - Take a screenshot when a step explicitly says to.
+   c. After each step, evaluate the Expected Result. Treat any "FAIL if ..." clause inside the Expected Result column as a hard-fail condition. The "FAIL if 500 ISE error is displayed" check must run on every step.
+   d. On any step failure: take a screenshot, record the failed step number and a one-line reason, and stop running the remaining steps in that test case. Continue with the next test case.
+4. After all test cases finish, write the following to the file path in $GITHUB_STEP_SUMMARY (use the Bash tool with `cat >> "$GITHUB_STEP_SUMMARY"` or equivalent):
+
+# TMP Regression Test Run
+
+**Environment:** $TMP_BASE_URL
+**Test Path:** $TEST_PATH
+**Total:** N  **Passed:** P  **Failed:** F
+
+| TC ID | Title | Status | Failed Step | Notes |
+| --- | --- | --- | --- | --- |
+| TC-RP-001 | Admin Login | ✅ pass | — | — |
+| TC-RP-002 | ... | ❌ fail | 5 | Repayment Plan button missing |
+
+5. Print exactly one line to stdout in this format so the workflow can parse it for Slack:
+   RESULT_SUMMARY: passed=P failed=F total=N
+
+If anything is genuinely ambiguous (e.g. a referenced selector cannot be located after a reasonable attempt), fail the affected test case with a clear one-line reason rather than guessing.
+````
+
+This task has no commit on its own — it documents the prompt for Tasks 5 and 6.
+
+- [ ] **Step 1: Acknowledge the canonical prompt above will be embedded in both workflow files in Tasks 5 and 6.**
+
+(No file changes, no commit. Move to Task 5.)
+
+---
+
+## Task 5: Auto-Trigger Workflow
 
 **Files:**
 - Create: `.github/workflows/run-tests.yml`
 
-- [ ] **Step 1: Write the workflow**
+- [ ] **Step 1: Create the directory**
+
+```bash
+mkdir -p /home/vaseem/ai-powerd-automation/.github/workflows
+```
+
+- [ ] **Step 2: Create the workflow file**
+
+Path: `/home/vaseem/ai-powerd-automation/.github/workflows/run-tests.yml`
+
+Contents:
 
 ```yaml
 name: Run Tests (auto)
@@ -935,40 +398,119 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      ENVIRONMENT: UAT
+      TEST_PATH: test-cases/
+      TMP_BASE_URL: ${{ secrets.TMP_UAT_URL }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
 
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+        run: npx -y playwright install --with-deps chromium
 
-      - name: Run tests
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          TMP_UAT_URL: ${{ secrets.TMP_UAT_URL }}
-          TMP_INT_URL: ${{ secrets.TMP_INT_URL }}
-          ENVIRONMENT: UAT
-          TEST_PATH: test-cases/
-        run: npm run run-test
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run regression suite
+        id: run
+        run: |
+          set -o pipefail
+          claude -p "$(cat <<'PROMPT'
+          You are a TMP regression test execution agent. You have Playwright MCP browser tools available (mcp__playwright__*).
+
+          Inputs (from environment variables):
+          - TMP_BASE_URL: base URL for the target environment (e.g. https://uat.themoneyplatform.com)
+          - TEST_PATH: a file path or directory under test-cases/
+
+          Your job:
+          1. Read config/userdetails.md to learn available test users (Admin, Borrower, etc).
+          2. Discover all *.md files at $TEST_PATH (or treat $TEST_PATH as a single file if it ends in .md). Process them in alphabetical order.
+          3. For each test case (each "### TC-..." heading) in each file:
+             a. Read the step table (columns: Step, Action, Expected Result).
+             b. Execute each step using Playwright MCP browser tools.
+                - Prefix any relative URL like "/login" with $TMP_BASE_URL.
+                - When a step says "from userdetails", look up the value in config/userdetails.md by the role mentioned in the step (Admin or Borrower).
+                - Take a screenshot when a step explicitly says to.
+             c. After each step, evaluate the Expected Result. Treat any "FAIL if ..." clause inside the Expected Result column as a hard-fail condition. The "FAIL if 500 ISE error is displayed" check must run on every step.
+             d. On any step failure: take a screenshot, record the failed step number and a one-line reason, and stop running the remaining steps in that test case. Continue with the next test case.
+          4. After all test cases finish, append the following to the file path in $GITHUB_STEP_SUMMARY (use the Bash tool with cat >> "$GITHUB_STEP_SUMMARY"):
+
+          # TMP Regression Test Run
+
+          **Environment:** $TMP_BASE_URL
+          **Test Path:** $TEST_PATH
+          **Total:** N  **Passed:** P  **Failed:** F
+
+          | TC ID | Title | Status | Failed Step | Notes |
+          | --- | --- | --- | --- | --- |
+
+          (Fill the table with one row per test case using ✅ pass or ❌ fail.)
+
+          5. Print exactly one line to stdout in this format so the workflow can parse it for Slack:
+             RESULT_SUMMARY: passed=P failed=F total=N
+
+          If anything is genuinely ambiguous, fail the affected test case with a one-line reason rather than guessing.
+          PROMPT
+          )" \
+            --mcp-config .mcp.json \
+            --allowedTools "mcp__playwright__*,Bash,Read,Glob" \
+            --output-format text \
+            | tee claude-output.txt
+
+          # Extract result summary line for Slack step
+          summary_line="$(grep -E '^RESULT_SUMMARY:' claude-output.txt | tail -n1 || true)"
+          if [ -z "$summary_line" ]; then
+            summary_line="RESULT_SUMMARY: passed=0 failed=0 total=0"
+          fi
+          echo "summary=$summary_line" >> "$GITHUB_OUTPUT"
+          # Fail the job if any test failed
+          failed=$(echo "$summary_line" | sed -n 's/.*failed=\([0-9]\+\).*/\1/p')
+          if [ "${failed:-0}" -gt 0 ]; then exit 1; fi
 
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
-          path: reports/
+          path: |
+            reports/
+            claude-output.txt
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SUMMARY: ${{ steps.run.outputs.summary }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ENV_NAME: UAT
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set; skipping Slack notification"
+            exit 0
+          fi
+          icon=":white_check_mark:"
+          case "$SUMMARY" in *failed=0*) ;; *) icon=":x:" ;; esac
+          payload=$(printf '{"text":"%s TMP regression on %s — %s\\nRun: %s"}' \
+            "$icon" "$ENV_NAME" "$SUMMARY" "$RUN_URL")
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "$payload" "$SLACK_WEBHOOK_URL"
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 3: Lint check (offline)**
+
+```bash
+python3 -c "import yaml,sys; yaml.safe_load(open('/home/vaseem/ai-powerd-automation/.github/workflows/run-tests.yml')); print('YAML OK')"
+```
+
+Expected: `YAML OK`.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 git add .github/workflows/run-tests.yml
@@ -977,12 +519,16 @@ git commit -m "ci: add auto-trigger workflow for push and PR"
 
 ---
 
-## Task 10: GitHub Workflow — Manual Trigger
+## Task 6: Manual-Trigger Workflow
 
 **Files:**
 - Create: `.github/workflows/manual-run.yml`
 
-- [ ] **Step 1: Write the workflow**
+- [ ] **Step 1: Create the workflow file**
+
+Path: `/home/vaseem/ai-powerd-automation/.github/workflows/manual-run.yml`
+
+Contents:
 
 ```yaml
 name: Run Tests (manual)
@@ -999,7 +545,7 @@ on:
           - UAT
           - INT
       test_path:
-        description: 'Test file or directory (e.g. test-cases/login/login-basic.md)'
+        description: 'Test file or directory (e.g. test-cases/repayment-plan/admin-borrower-repayment-plan.md)'
         required: true
         default: 'test-cases/'
         type: string
@@ -1007,40 +553,127 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      TEST_PATH: ${{ inputs.test_path }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Resolve base URL for environment
+        id: env
+        run: |
+          if [ "$ENVIRONMENT" = "INT" ]; then
+            echo "base_url=${{ secrets.TMP_INT_URL }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_url=${{ secrets.TMP_UAT_URL }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+        run: npx -y playwright install --with-deps chromium
 
-      - name: Run tests
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run regression suite
+        id: run
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          TMP_UAT_URL: ${{ secrets.TMP_UAT_URL }}
-          TMP_INT_URL: ${{ secrets.TMP_INT_URL }}
-          ENVIRONMENT: ${{ inputs.environment }}
-          TEST_PATH: ${{ inputs.test_path }}
-        run: npm run run-test
+          TMP_BASE_URL: ${{ steps.env.outputs.base_url }}
+        run: |
+          set -o pipefail
+          claude -p "$(cat <<'PROMPT'
+          You are a TMP regression test execution agent. You have Playwright MCP browser tools available (mcp__playwright__*).
+
+          Inputs (from environment variables):
+          - TMP_BASE_URL: base URL for the target environment
+          - TEST_PATH: a file path or directory under test-cases/
+
+          Your job:
+          1. Read config/userdetails.md to learn available test users (Admin, Borrower, etc).
+          2. Discover all *.md files at $TEST_PATH (or treat $TEST_PATH as a single file if it ends in .md). Process them in alphabetical order.
+          3. For each test case (each "### TC-..." heading) in each file:
+             a. Read the step table (columns: Step, Action, Expected Result).
+             b. Execute each step using Playwright MCP browser tools.
+                - Prefix any relative URL like "/login" with $TMP_BASE_URL.
+                - When a step says "from userdetails", look up the value in config/userdetails.md by the role mentioned in the step (Admin or Borrower).
+                - Take a screenshot when a step explicitly says to.
+             c. After each step, evaluate the Expected Result. Treat any "FAIL if ..." clause inside the Expected Result column as a hard-fail condition. The "FAIL if 500 ISE error is displayed" check must run on every step.
+             d. On any step failure: take a screenshot, record the failed step number and a one-line reason, and stop running the remaining steps in that test case. Continue with the next test case.
+          4. After all test cases finish, append the following to the file path in $GITHUB_STEP_SUMMARY (use the Bash tool with cat >> "$GITHUB_STEP_SUMMARY"):
+
+          # TMP Regression Test Run
+
+          **Environment:** $TMP_BASE_URL
+          **Test Path:** $TEST_PATH
+          **Total:** N  **Passed:** P  **Failed:** F
+
+          | TC ID | Title | Status | Failed Step | Notes |
+          | --- | --- | --- | --- | --- |
+
+          (Fill the table with one row per test case using ✅ pass or ❌ fail.)
+
+          5. Print exactly one line to stdout in this format so the workflow can parse it for Slack:
+             RESULT_SUMMARY: passed=P failed=F total=N
+
+          If anything is genuinely ambiguous, fail the affected test case with a one-line reason rather than guessing.
+          PROMPT
+          )" \
+            --mcp-config .mcp.json \
+            --allowedTools "mcp__playwright__*,Bash,Read,Glob" \
+            --output-format text \
+            | tee claude-output.txt
+
+          summary_line="$(grep -E '^RESULT_SUMMARY:' claude-output.txt | tail -n1 || true)"
+          if [ -z "$summary_line" ]; then
+            summary_line="RESULT_SUMMARY: passed=0 failed=0 total=0"
+          fi
+          echo "summary=$summary_line" >> "$GITHUB_OUTPUT"
+          failed=$(echo "$summary_line" | sed -n 's/.*failed=\([0-9]\+\).*/\1/p')
+          if [ "${failed:-0}" -gt 0 ]; then exit 1; fi
 
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
-          path: reports/
+          path: |
+            reports/
+            claude-output.txt
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SUMMARY: ${{ steps.run.outputs.summary }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ENV_NAME: ${{ inputs.environment }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set; skipping Slack notification"
+            exit 0
+          fi
+          icon=":white_check_mark:"
+          case "$SUMMARY" in *failed=0*) ;; *) icon=":x:" ;; esac
+          payload=$(printf '{"text":"%s TMP regression on %s — %s\\nRun: %s"}' \
+            "$icon" "$ENV_NAME" "$SUMMARY" "$RUN_URL")
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "$payload" "$SLACK_WEBHOOK_URL"
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 2: Lint check**
+
+```bash
+python3 -c "import yaml,sys; yaml.safe_load(open('/home/vaseem/ai-powerd-automation/.github/workflows/manual-run.yml')); print('YAML OK')"
+```
+
+Expected: `YAML OK`.
+
+- [ ] **Step 3: Commit**
 
 ```bash
 git add .github/workflows/manual-run.yml
@@ -1049,7 +682,39 @@ git commit -m "ci: add manual workflow with environment selector"
 
 ---
 
-## Task 11: Update README
+## Task 7: `.gitignore` and Reports Placeholder
+
+**Files:**
+- Modify: `.gitignore`
+- Create: `reports/.gitkeep`
+
+- [ ] **Step 1: Append rule to `.gitignore`**
+
+Append (only) these lines to the existing `.gitignore`:
+
+```
+# Workflow output
+reports/*
+!reports/.gitkeep
+claude-output.txt
+```
+
+- [ ] **Step 2: Create reports placeholder**
+
+```bash
+mkdir -p /home/vaseem/ai-powerd-automation/reports && touch /home/vaseem/ai-powerd-automation/reports/.gitkeep
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add .gitignore reports/.gitkeep
+git commit -m "chore: ignore workflow output, keep reports/ dir"
+```
+
+---
+
+## Task 8: Update README
 
 **Files:**
 - Modify: `README.md`
@@ -1059,113 +724,132 @@ git commit -m "ci: add manual workflow with environment selector"
 ```markdown
 # ai-powerd-automation
 
-AI-powered test automation framework. Claude (via the Anthropic API) reads plain-English test cases from `.md` files and drives a headless Chromium browser via Playwright MCP. Runs on GitHub Actions.
+Zero-code regression test framework for The Money Platform (TMP). Test cases live as
+`.md` files. GitHub Actions runs Claude Code CLI with a master prompt, and Claude
+drives a headless Chromium browser via Playwright MCP to execute the tests.
+Results are posted to the GitHub Actions summary and a Slack channel.
 
-## How it works
+## How a run works
 
-1. You write a test case in plain English in a `.md` file under `test-cases/`.
+1. You add or edit a `.md` test file under `test-cases/`.
 2. GitHub Actions runs the test (auto on push/PR, or manual via the Actions tab).
-3. The runner sends your steps to Claude, which calls Playwright MCP browser tools to execute them.
-4. Results land in the GitHub Actions summary and a Slack channel.
-
-## Test case format
-
-```markdown
----
-name: Login - Valid Credentials
-environment: both       # UAT, INT, or both
-url_path: /login
----
-
-## Steps
-
-1. Navigate to the login page
-2. Enter the standard user email from userdetails
-3. Enter the standard user password from userdetails
-4. Click the "Sign In" button
-
-## Expected Result
-The user is logged in and the dashboard page is visible.
-```
+3. The workflow runs `claude -p "<master prompt>" --mcp-config .mcp.json --allowedTools "mcp__playwright__*"`.
+4. Claude reads `config/userdetails.md` and the test file(s), drives the browser, and writes a results table to the job summary.
+5. A Slack webhook posts a one-line pass/fail summary with a link to the run.
 
 ## Project layout
 
-- `test-cases/` — your test cases (`.md`)
-- `config/userdetails.json` — test user credentials
-- `scripts/` — runner code
-- `.github/workflows/` — auto and manual CI workflows
+- `test-cases/` — `.md` test files (TMP regression format)
+- `config/userdetails.md` — single source of truth for test user credentials
+- `.github/workflows/run-tests.yml` — auto on push/PR (UAT)
+- `.github/workflows/manual-run.yml` — manual dispatch with environment + test path
+- `.mcp.json` — Playwright MCP config
+
+## Test file format
+
+Use `## N. Section Title` to group cases, then one or more `### TC-XXX-NNN: Title`
+test cases. Each test case has a step table with three columns: Step, Action,
+Expected Result. Inline `**FAIL** if ...` clauses define hard-fail conditions
+Claude must check at every step.
+
+See `test-cases/repayment-plan/admin-borrower-repayment-plan.md` for a full example.
 
 ## Required GitHub secrets
 
 | Secret | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude API |
-| `SLACK_WEBHOOK_URL` | Slack notifications |
+| `ANTHROPIC_API_KEY` | Claude Code authentication |
+| `SLACK_WEBHOOK_URL` | Pass/fail notifications |
 | `TMP_UAT_URL` | UAT base URL |
 | `TMP_INT_URL` | INT base URL |
 
-## Running locally
+## Adding a new test
 
-```bash
-npm install
-npx playwright install chromium
-cp .env.example .env   # fill in values
-ENVIRONMENT=UAT TEST_PATH=test-cases/login/login-basic.md npm run run-test
+1. Create a new `.md` file under `test-cases/<feature>/`.
+2. Write test cases using the TMP regression format (Document Information,
+   Test Data Configuration, then `## N.` sections containing `### TC-...` cases).
+3. If you need a new test user role, add a section to `config/userdetails.md`
+   and reference it from steps as "from userdetails (Role)".
+4. Push. The auto workflow runs against UAT. Use the manual workflow to target INT.
+
+## Adding a new test user
+
+Edit `config/userdetails.md` and add a new role section:
+
+```markdown
+## NewRole
+- **Email**: `someone@example.com`
+- **Password**: `secret`
 ```
 
-## Running unit tests
-
-```bash
-npm test
-```
+Then reference it in test steps: "Enter the NewRole email from userdetails".
 ```
 
 - [ ] **Step 2: Commit**
 
 ```bash
 git add README.md
-git commit -m "docs: update README with usage instructions"
+git commit -m "docs: rewrite README for prompt-only architecture"
 ```
 
 ---
 
-## Task 12: End-to-End Smoke Verification
+## Task 9: End-to-End Smoke Verification (Manual Gate)
 
-This is a manual verification gate — confirms the runner can complete one real test against a live URL before relying on CI.
+This is a manual gate before pushing. Confirms the framework is wired up correctly.
 
-- [ ] **Step 1: Confirm `.env` is filled in**
+- [ ] **Step 1: Confirm GitHub Secrets are set in the repo**
 
-Check `/home/vaseem/ai-powerd-automation/.env` contains real values for `ANTHROPIC_API_KEY`, `TMP_UAT_URL`, and that `config/userdetails.json` has real credentials. (Do NOT commit `.env`.)
+Open the repo on GitHub → Settings → Secrets and variables → Actions, and confirm:
+- `ANTHROPIC_API_KEY`
+- `SLACK_WEBHOOK_URL`
+- `TMP_UAT_URL`
+- `TMP_INT_URL`
 
-- [ ] **Step 2: Run the sample test locally**
+(These cannot be set via CLI without `gh` installed; do this in the browser.)
+
+- [ ] **Step 2: Confirm `config/userdetails.md` has real credentials**
+
+Open `/home/vaseem/ai-powerd-automation/config/userdetails.md` and verify Admin email/password are real (the borrower placeholder can stay until needed).
+
+- [ ] **Step 3: Push the branch**
 
 ```bash
 cd /home/vaseem/ai-powerd-automation
-set -a; source .env; set +a
-ENVIRONMENT=UAT TEST_PATH=test-cases/login/login-basic.md npm run run-test
+git push -u origin feat/ai-automation-framework
 ```
 
-Expected: Console shows the test name, then either `pass` or `fail` with a reason. `reports/summary.md` is written. Exit code is 0 on pass, 1 on fail.
+- [ ] **Step 4: Open a PR to `main` to trigger the auto workflow**
 
-- [ ] **Step 3: If the test passed, you're done**
+Open the GitHub UI, create a PR `feat/ai-automation-framework → main`. Watch the "Run Tests (auto)" check.
+Expected: workflow runs, results table appears in the job summary, Slack message arrives.
 
-Push the branch and watch the GitHub Actions run on `main`. Configure secrets in GitHub repo settings before pushing.
+- [ ] **Step 5: Trigger a manual run against INT**
 
-- [ ] **Step 4: Final commit (if any tweaks were needed)**
+GitHub Actions tab → "Run Tests (manual)" → Run workflow → environment: `INT`, test_path: `test-cases/repayment-plan/admin-borrower-repayment-plan.md`.
+Expected: workflow runs against INT, results posted as above.
 
-If you adjusted anything during smoke testing:
+- [ ] **Step 6: Merge once green, or fix and re-run**
 
-```bash
-git add -A
-git commit -m "chore: smoke-test fixes"
-```
+If both runs are green, merge. If something fails, examine the job summary and the `claude-output.txt` artifact.
 
 ---
 
 ## Self-Review Notes
 
-**Spec coverage:** Every section of the spec maps to a task — repo structure (1, 7, 8), data flow (5, 6, 7), test format (8 + parser in 2), credentials (3), workflows (9, 10), secrets (handled in workflow env blocks).
+**Spec coverage (point-by-point):**
+- Repository structure (no scripts) → Tasks 1, 2, 3, 5, 6, 7
+- TMP regression test format → Task 3 (sample) + master prompt in Tasks 5/6
+- `userdetails.md` with role lookup → Task 2 + master-prompt step 3b
+- Auto + manual workflows → Tasks 5, 6
+- Master prompt embedded in workflows → Task 4 (canonical) + Tasks 5, 6 (embedded)
+- GitHub Actions summary + Slack → workflow steps in Tasks 5, 6
+- Required secrets table → README in Task 8 + workflow `env:` blocks
+- Sanitized `.mcp.json` → Task 1
+- Architecture decisions table reflects no-scripts choice → README in Task 8
 
-**Type consistency:** `parseTestCase` returns `{name, environment, urlPath, steps, expectedResult}` — `runTestWithClaude` and `run-test.js` consume those exact fields. `mcpClient` shape is `{tools, callTool, close}` defined in Task 5 and used in Tasks 6 and 7.
+**Placeholder scan:** No TBDs, no "implement later", no "similar to Task N" without code, no missing commit messages.
 
-**Security note:** Task 8 explicitly removes the hardcoded Airtable keys from `.mcp.json` before they could be pushed to GitHub. `userdetails.json` is committed per user preference.
+**Type/name consistency:** `TMP_BASE_URL` is the var name in both workflows and the master prompt. `TEST_PATH` likewise. `ENVIRONMENT` in input → resolves to `TMP_BASE_URL` in manual-run. `RESULT_SUMMARY:` prefix is identical in both workflows for Slack parsing.
+
+**Security:** Task 1 strips Airtable keys from `.mcp.json` before any commit. `userdetails.md` is committed per user preference (private repo).
