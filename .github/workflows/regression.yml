@@ -117,6 +117,7 @@ jobs:
             set +e
             claude --print \
                    --permission-mode bypassPermissions \
+                   --mcp-config .mcp.json \
                    --output-format text \
                    "$prompt" > "$log" 2>&1
             exit_code=$?
