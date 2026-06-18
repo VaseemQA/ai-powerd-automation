@@ -8,5 +8,5 @@ Single source of truth for test users. Test cases reference this file by user ro
 - **Password**: `Test@123`
 
 ## Borrower (Standard)
-- **Email**: `borrower@example.com`
+- **Email**: `cypresslll152021@themoneyplatform.com`
 - **Password**: `Test@123`
