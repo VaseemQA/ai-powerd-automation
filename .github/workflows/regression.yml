@@ -28,7 +28,7 @@ jobs:
     env:
       TEST_ENV: ${{ github.event.inputs.environment || 'UAT' }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      CODEX_MODEL: gpt-5-codex
+      CODEX_MODEL: gpt-5
 
     steps:
       - name: Checkout
